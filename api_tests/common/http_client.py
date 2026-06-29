@@ -3,7 +3,6 @@ import json
 import allure
 import requests
 
-
 class HttpClient:
     def __init__(self, base_url, timeout=10, headers=None):
         self.base_url = base_url.rstrip("/")
@@ -16,6 +15,15 @@ class HttpClient:
 
     def post(self, path, json_body=None, **kwargs):
         return self._request("POST", path, json=json_body, **kwargs)
+
+    def post_multipart(self, path, files=None, data=None, **kwargs):
+        return self._request(
+            "POST",
+            path,
+            files=files,
+            data=data,
+            **kwargs,
+        )
 
     def put(self, path, json_body=None, **kwargs):
         return self._request("PUT", path, json=json_body, **kwargs)
@@ -40,6 +48,8 @@ class HttpClient:
             "url": url,
             "params": kwargs.get("params"),
             "json": kwargs.get("json"),
+            "data": kwargs.get("data"),
+            "files": list(kwargs.get("files", {}).keys()) if kwargs.get("files") else None,
         }
         allure.attach(
             json.dumps(request_info, ensure_ascii=False, indent=2),
