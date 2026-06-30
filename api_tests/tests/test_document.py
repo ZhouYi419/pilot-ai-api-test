@@ -1,3 +1,5 @@
+import time
+
 import allure
 import pytest
 
@@ -73,6 +75,23 @@ def uploaded_document(api_client, created_module):
 
     api_client.delete(f"/api/documents/{document_id}")
 
+def wait_document_parse_finished(api_client, document_id, timeout_seconds=10):
+    deadline = time.time() + timeout_seconds
+    last_body = None
+
+    while time.time() < deadline:
+        response = api_client.get(f"/api/documents/{document_id}/status")
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        last_body = body
+
+        parse_status = body["data"]["parseStatus"]
+        if parse_status in ["SUCCESS", "FAILED"]:
+            return body
+
+        time.sleep(0.5)
+
+    pytest.fail(f"文档解析未在 {timeout_seconds} 秒内完成，最后状态：{last_body}")
 
 @allure.epic("TestPilot AI")
 @allure.feature("模块文档管理")
@@ -198,6 +217,13 @@ class TestDocumentApi:
         assert body["data"]["id"] == document_id
         assert body["data"]["documentName"] == uploaded_document["form"]["documentName"]
 
+        data = body["data"]
+
+        assert data["id"] == document_id
+        assert data["documentName"] == uploaded_document["form"]["documentName"]
+        assert data["parseStatus"] in ["PENDING", "PARSING", "SUCCESS", "FAILED"]
+        assert data["indexStatus"] in ["PENDING", "INDEXING", "SUCCESS", "FAILED"]
+
     @allure.story("文档详情管理")
     @allure.title("查询文档处理状态成功")
     def test_get_document_status_success(self, api_client, uploaded_document):
@@ -207,10 +233,11 @@ class TestDocumentApi:
 
         assert_http_status(response, 200)
         body = assert_success_response(response)
+        data = body["data"]
 
-        assert body["data"]["documentId"] == document_id
-        assert body["data"]["parseStatus"] in ["PENDING", "PARSING", "SUCCESS", "FAILED"]
-        assert body["data"]["indexStatus"] in ["PENDING", "INDEXING", "SUCCESS", "FAILED"]
+        assert data["documentId"] == document_id
+        assert data["parseStatus"] in ["PENDING", "PARSING", "SUCCESS", "FAILED"]
+        assert data["indexStatus"] in ["PENDING", "INDEXING", "SUCCESS", "FAILED"]
 
     @allure.story("文档详情管理")
     @allure.title("生成文档临时下载地址成功")
@@ -261,3 +288,42 @@ class TestDocumentApi:
 
         assert_http_status(response, 404)
         assert_error_response(response)
+
+    @allure.story("文档详情管理")
+    @allure.title("手动提交文档解析任务成功")
+    def test_trigger_document_parse_success(self, api_client, uploaded_document):
+        document_id = uploaded_document["documentId"]
+
+        wait_document_parse_finished(api_client, document_id)
+
+        response = api_client.post(f"/api/documents/{document_id}/parse")
+
+        assert_http_status(response, 202)
+        body = assert_success_response(response)
+
+        assert body["data"]["documentId"] == document_id
+        assert body["data"]["parseStatus"] in ["PENDING", "PARSING", "SUCCESS", "FAILED"]
+
+    @allure.story("文档详情管理")
+    @allure.title("查询文档解析文本成功")
+    def test_get_document_content_success(self, api_client, uploaded_document):
+        document_id = uploaded_document["documentId"]
+
+        status_body = wait_document_parse_finished(api_client, document_id)
+        assert status_body["data"]["parseStatus"] == "SUCCESS"
+
+        response = api_client.get(f"/api/documents/{document_id}/content")
+
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        data = body["data"]
+
+        assert data["documentId"] == document_id
+        assert data["documentName"] == uploaded_document["form"]["documentName"]
+        assert data["version"] == uploaded_document["form"]["version"]
+        assert data["detectedContentType"]
+        assert data["parserName"]
+        assert data["parsedCharCount"] > 0
+        assert data["cleanCharCount"] > 0
+        assert data["parsedContent"]
+        assert data["cleanContent"]
