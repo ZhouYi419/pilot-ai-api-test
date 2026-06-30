@@ -97,6 +97,28 @@ def chunked_document(api_client, parsed_document):
 
     return parsed_document
 
+@pytest.fixture
+def parsed_document(api_client, uploaded_document):
+    document_id = uploaded_document["documentId"]
+
+    status_body = wait_document_parse_finished(api_client, document_id)
+    assert status_body["data"]["parseStatus"] == "SUCCESS"
+
+    return uploaded_document
+
+@pytest.fixture
+def chunked_document(api_client, parsed_document):
+    document_id = parsed_document["documentId"]
+
+    response = api_client.post(f"/api/documents/{document_id}/chunk")
+    assert_http_status(response, 202)
+    assert_success_response(response)
+
+    status_body = wait_document_chunk_finished(api_client, document_id)
+    assert status_body["data"]["chunkStatus"] == "SUCCESS"
+
+    return parsed_document
+
 def wait_document_parse_finished(api_client, document_id, timeout_seconds=10):
     deadline = time.time() + timeout_seconds
     last_body = None
@@ -114,6 +136,24 @@ def wait_document_parse_finished(api_client, document_id, timeout_seconds=10):
         time.sleep(0.5)
 
     pytest.fail(f"文档解析未在 {timeout_seconds} 秒内完成，最后状态：{last_body}")
+
+def wait_document_chunk_finished(api_client, document_id, timeout_seconds=10):
+    deadline = time.time() + timeout_seconds
+    last_body = None
+
+    while time.time() < deadline:
+        response = api_client.get(f"/api/documents/{document_id}/chunk-status")
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        last_body = body
+
+        chunk_status = body["data"]["chunkStatus"]
+        if chunk_status in ["SUCCESS", "FAILED"]:
+            return body
+
+        time.sleep(0.5)
+
+    pytest.fail(f"文档切片未在 {timeout_seconds} 秒内完成，最后状态：{last_body}")
 
 def wait_document_chunk_finished(api_client, document_id, timeout_seconds=10):
     deadline = time.time() + timeout_seconds
@@ -367,6 +407,131 @@ class TestDocumentApi:
         assert data["cleanCharCount"] > 0
         assert data["parsedContent"]
         assert data["cleanContent"]
+
+    @allure.story("文档切片管理")
+    @allure.title("提交文档切片任务成功")
+    def test_trigger_document_chunk_success(self, api_client, parsed_document):
+        document_id = parsed_document["documentId"]
+
+        response = api_client.post(f"/api/documents/{document_id}/chunk")
+
+        assert_http_status(response, 202)
+        body = assert_success_response(response)
+        data = body["data"]
+
+        assert data["documentId"] == document_id
+        assert data["parseStatus"] == "SUCCESS"
+        assert data["chunkStatus"] in ["PENDING", "CHUNKING", "SUCCESS", "FAILED"]
+        assert data["indexStatus"] in ["PENDING", "INDEXING", "SUCCESS", "FAILED"]
+
+    @allure.story("文档切片管理")
+    @allure.title("查询文档切片状态成功")
+    def test_get_document_chunk_status_success(self, api_client, chunked_document):
+        document_id = chunked_document["documentId"]
+
+        response = api_client.get(f"/api/documents/{document_id}/chunk-status")
+
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        data = body["data"]
+
+        assert data["documentId"] == document_id
+        assert data["parseStatus"] == "SUCCESS"
+        assert data["chunkStatus"] == "SUCCESS"
+        assert data["parentChunkCount"] > 0
+        assert data["childChunkCount"] > 0
+        assert data["chunkStartedAt"]
+        assert data["chunkFinishedAt"]
+        assert data["chunkDurationMs"] >= 0
+
+    @allure.story("文档切片管理")
+    @allure.title("分页查询文档知识块成功")
+    def test_query_document_chunks_success(self, api_client, chunked_document):
+        document_id = chunked_document["documentId"]
+
+        response = api_client.get(
+            f"/api/documents/{document_id}/chunks",
+            params={
+                "pageNum": 1,
+                "pageSize": 10,
+            },
+        )
+
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        data = body["data"]
+
+        assert "records" in data
+        assert data["total"] > 0
+        assert data["pageNum"] == 1
+        assert data["pageSize"] == 10
+
+        first_chunk = data["records"][0]
+        assert first_chunk["id"]
+        assert first_chunk["documentId"] == document_id
+        assert first_chunk["chunkLevel"] in ["PARENT", "CHILD"]
+        assert first_chunk["sectionType"]
+        assert first_chunk["content"]
+        assert first_chunk["chunkIndex"] >= 0
+        assert first_chunk["charCount"] > 0
+        assert first_chunk["tokenCount"] > 0
+
+    @allure.story("文档切片管理")
+    @allure.title("按知识块层级筛选成功")
+    def test_query_document_chunks_by_level_success(self, api_client, chunked_document):
+        document_id = chunked_document["documentId"]
+
+        response = api_client.get(
+            f"/api/documents/{document_id}/chunks",
+            params={
+                "pageNum": 1,
+                "pageSize": 10,
+                "chunkLevel": "PARENT",
+            },
+        )
+
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+
+        for item in body["data"]["records"]:
+            assert item["chunkLevel"] == "PARENT"
+
+    @allure.story("文档切片管理")
+    @allure.title("树形查询父子知识块成功")
+    def test_query_document_chunk_tree_success(self, api_client, chunked_document):
+        document_id = chunked_document["documentId"]
+
+        response = api_client.get(f"/api/documents/{document_id}/chunks/tree")
+
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        data = body["data"]
+
+        assert isinstance(data, list)
+        assert len(data) > 0
+
+        first_node = data[0]
+        assert first_node["parent"]["documentId"] == document_id
+        assert first_node["parent"]["chunkLevel"] == "PARENT"
+        assert isinstance(first_node["children"], list)
+
+        if first_node["children"]:
+            assert first_node["children"][0]["chunkLevel"] == "CHILD"
+            assert first_node["children"][0]["parentChunkId"] == first_node["parent"]["id"]
+
+    @allure.story("文档切片管理")
+    @allure.title("未解析成功的文档提交切片失败")
+    def test_trigger_chunk_before_parse_finished_failed(self, api_client, uploaded_document):
+        document_id = uploaded_document["documentId"]
+
+        response = api_client.post(f"/api/documents/{document_id}/chunk")
+
+        if response.status_code == 202:
+            body = assert_success_response(response)
+            assert body["data"]["documentId"] == document_id
+        else:
+            assert_http_status(response, 400)
+            assert_error_response(response, expected_code=40008)
 
     @allure.story("文档切片管理")
     @allure.title("提交文档切片任务成功")
