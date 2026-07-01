@@ -15,7 +15,7 @@ from data.document_data import (
 )
 from data.module_data import build_module_create_payload
 from data.project_data import build_project_create_payload
-
+from data.rag_data import build_rag_retrieval_payload, build_invalid_rag_retrieval_payload, build_rag_question_payload
 
 @pytest.fixture
 def created_project(api_client):
@@ -119,6 +119,31 @@ def chunked_document(api_client, parsed_document):
 
     return parsed_document
 
+@pytest.fixture
+def indexed_document(api_client, chunked_document):
+    document_id = chunked_document["documentId"]
+
+    response = api_client.post(f"/api/documents/{document_id}/index")
+
+    if response.status_code == 400:
+        body = assert_error_response(response, expected_code=40010)
+        return {
+            **chunked_document,
+            "indexSkipped": True,
+            "skipReason": body["message"],
+        }
+
+    assert_http_status(response, 202)
+    assert_success_response(response)
+
+    status_body = wait_document_index_finished(api_client, document_id)
+
+    return {
+        **chunked_document,
+        "indexSkipped": False,
+        "indexStatusBody": status_body,
+    }
+
 def wait_document_parse_finished(api_client, document_id, timeout_seconds=10):
     deadline = time.time() + timeout_seconds
     last_body = None
@@ -172,6 +197,24 @@ def wait_document_chunk_finished(api_client, document_id, timeout_seconds=10):
         time.sleep(0.5)
 
     pytest.fail(f"文档切片未在 {timeout_seconds} 秒内完成，最后状态：{last_body}")
+
+def wait_document_index_finished(api_client, document_id, timeout_seconds=20):
+    deadline = time.time() + timeout_seconds
+    last_body = None
+
+    while time.time() < deadline:
+        response = api_client.get(f"/api/documents/{document_id}/index-status")
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        last_body = body
+
+        index_status = body["data"]["indexStatus"]
+        if index_status in ["SUCCESS", "FAILED"]:
+            return body
+
+        time.sleep(0.5)
+
+    pytest.fail(f"文档索引未在 {timeout_seconds} 秒内完成，最后状态：{last_body}")
 
 @allure.epic("TestPilot AI")
 @allure.feature("模块文档管理")
@@ -657,3 +700,139 @@ class TestDocumentApi:
         else:
             assert_http_status(response, 400)
             assert_error_response(response, expected_code=40008)
+
+    @allure.story("RAG检索")
+    @allure.title("RAG检索成功或提示Embedding未配置")
+    @pytest.mark.rag
+    def test_rag_retrieval_search(self, api_client, indexed_document):
+        if indexed_document.get("indexSkipped"):
+            pytest.skip(indexed_document["skipReason"])
+
+        document_id = indexed_document["documentId"]
+
+        detail_response = api_client.get(f"/api/documents/{document_id}")
+        assert_http_status(detail_response, 200)
+        detail_body = assert_success_response(detail_response)
+
+        project_id = detail_body["data"]["projectId"]
+        module_id = detail_body["data"]["moduleId"]
+
+        payload = build_rag_retrieval_payload(
+            project_id=project_id,
+            module_id=module_id,
+            document_id=document_id,
+        )
+
+        response = api_client.post(
+            "/api/rag/retrieval/search",
+            json_body=payload,
+        )
+
+        if response.status_code == 400:
+            assert_error_response(response, expected_code=40010)
+            return
+
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        data = body["data"]
+
+        assert data["query"] == payload["query"]
+        assert data["projectId"] == project_id
+        assert data["moduleId"] == module_id
+        assert data["embeddingModel"]
+        assert data["embeddingDimension"] == 1024
+        assert data["topK"] == payload["topK"]
+        assert data["minScore"] == payload["minScore"]
+        assert data["candidateCount"] >= 0
+        assert data["returnedContextCount"] >= 0
+        assert data["retrievalDurationMs"] >= 0
+        assert isinstance(data["contexts"], list)
+
+        if data["contexts"]:
+            first = data["contexts"][0]
+            assert first["rank"] >= 1
+            assert first["score"] >= -1.0
+            assert first["parentChunkId"]
+            assert first["source"]
+            assert isinstance(first["matchedChildren"], list)
+
+    @allure.story("RAG检索")
+    @allure.title("RAG检索失败：必填参数为空")
+    @pytest.mark.rag
+    def test_rag_retrieval_invalid_payload_failed(self, api_client):
+        response = api_client.post(
+            "/api/rag/retrieval/search",
+            json_body=build_invalid_rag_retrieval_payload(),
+        )
+
+        assert_http_status(response, 400)
+        assert_error_response(response, expected_code=40000)
+
+    @allure.story("RAG问答")
+    @allure.title("RAG问答成功或提示模型未配置")
+    @pytest.mark.rag
+    def test_rag_qa_ask(self, api_client, indexed_document):
+        if indexed_document.get("indexSkipped"):
+            pytest.skip(indexed_document["skipReason"])
+
+        document_id = indexed_document["documentId"]
+
+        detail_response = api_client.get(f"/api/documents/{document_id}")
+        assert_http_status(detail_response, 200)
+        detail_body = assert_success_response(detail_response)
+
+        project_id = detail_body["data"]["projectId"]
+        module_id = detail_body["data"]["moduleId"]
+
+        payload = build_rag_question_payload(
+            project_id=project_id,
+            module_id=module_id,
+            document_id=document_id,
+        )
+
+        response = api_client.post(
+            "/api/rag/qa/ask",
+            json_body=payload,
+        )
+
+        if response.status_code == 400:
+            body = assert_error_response(response)
+            assert body["code"] in [40010, 40012]
+            return
+
+        if response.status_code == 502:
+            body = assert_error_response(response)
+            assert body["code"] in [50201, 50202]
+            return
+
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        data = body["data"]
+
+        assert data["qaLogId"]
+        assert data["requestId"]
+        assert data["question"] == payload["question"]
+        assert data["answer"]
+        assert data["qaStatus"] in ["SUCCESS", "NO_CONTEXT", "FAILED"]
+        assert data["grounded"] in [True, False]
+        assert data["modelCalled"] in [True, False]
+        assert data["retrievalCandidateCount"] >= 0
+        assert data["retrievalContextCount"] >= 0
+        assert data["totalDurationMs"] >= 0
+        assert isinstance(data["sources"], list)
+
+        detail_response = api_client.get(f"/api/rag/qa/logs/{data['qaLogId']}")
+        assert_http_status(detail_response, 200)
+        detail_body = assert_success_response(detail_response)
+
+        assert detail_body["data"]["qaLogId"] == data["qaLogId"]
+        assert detail_body["data"]["requestId"] == data["requestId"]
+
+    @allure.story("RAG问答")
+    @allure.title("查询不存在的RAG问答日志失败")
+    @pytest.mark.rag
+    def test_get_rag_qa_log_not_found(self, api_client):
+        response = api_client.get("/api/rag/qa/logs/999999999")
+
+        assert_http_status(response, 404)
+        assert_error_response(response, expected_code=40404)
