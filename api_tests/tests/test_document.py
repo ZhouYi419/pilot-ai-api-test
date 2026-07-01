@@ -1,4 +1,5 @@
 import time
+from asyncio import timeout
 
 import allure
 import pytest
@@ -16,6 +17,9 @@ from data.document_data import (
 from data.module_data import build_module_create_payload
 from data.project_data import build_project_create_payload
 from data.rag_data import build_rag_retrieval_payload, build_invalid_rag_retrieval_payload, build_rag_question_payload
+from data.testcase_data import build_invalid_functional_test_case_generation_payload, \
+    build_functional_test_case_generation_payload
+
 
 @pytest.fixture
 def created_project(api_client):
@@ -836,3 +840,115 @@ class TestDocumentApi:
 
         assert_http_status(response, 404)
         assert_error_response(response, expected_code=40404)
+
+    @allure.story("AI功能测试用例生成")
+    @allure.title("生成功能测试用例成功或提示模型未配置")
+    @pytest.mark.testcase
+    def test_generate_functional_test_cases(self, api_client, indexed_document):
+        if indexed_document.get("indexSkipped"):
+            pytest.skip(indexed_document["skipReason"])
+
+        document_id = indexed_document["documentId"]
+
+        detail_response = api_client.get(f"/api/documents/{document_id}")
+        assert_http_status(detail_response, 200)
+        detail_body = assert_success_response(detail_response)
+
+        project_id = detail_body["data"]["projectId"]
+        module_id = detail_body["data"]["moduleId"]
+
+        payload = build_functional_test_case_generation_payload(
+            project_id=project_id,
+            module_id=module_id,
+            document_id=document_id,
+        )
+
+        response = api_client.post(
+            "/api/test-cases/generations",
+            json_body=payload,
+            timeout=300
+        )
+
+        if response.status_code == 400:
+            body = assert_error_response(response)
+            assert body["code"] in [40010, 40012]
+            return
+
+        if response.status_code == 502:
+            body = assert_error_response(response)
+            assert body["code"] in [50201, 50202, 50203]
+            return
+
+        assert_http_status(response, 200)
+        body = assert_success_response(response)
+        data = body["data"]
+
+        assert data["taskId"]
+        assert data["requestId"]
+        assert data["projectId"] == project_id
+        assert data["moduleId"] == module_id
+        assert data["generationGoal"] == payload["generationGoal"]
+        assert data["generationStatus"] in ["SUCCESS", "NO_CONTEXT", "FAILED"]
+        assert data["requestedCaseCount"] == payload["caseCount"]
+        assert data["generatedCaseCount"] >= 0
+        assert data["retrievalCandidateCount"] >= 0
+        assert data["retrievalContextCount"] >= 0
+        assert data["totalDurationMs"] >= 0
+        assert isinstance(data["testCases"], list)
+
+        if data["generationStatus"] == "SUCCESS":
+            assert data["generatedCaseCount"] > 0
+            assert len(data["testCases"]) == data["generatedCaseCount"]
+
+            first_case = data["testCases"][0]
+            assert first_case["id"]
+            assert first_case["caseCode"]
+            assert first_case["title"]
+            assert first_case["priority"] in ["P0", "P1", "P2", "P3"]
+            assert first_case["caseType"] in [
+                "NORMAL",
+                "EXCEPTION",
+                "BOUNDARY",
+                "SECURITY",
+                "PERMISSION",
+                "DATA_CONSISTENCY",
+                "COMPATIBILITY",
+                "USABILITY",
+            ]
+            assert first_case["steps"]
+            assert first_case["expectedResult"]
+
+            first_step = first_case["steps"][0]
+            assert first_step["stepNo"] >= 1
+            assert first_step["action"]
+            assert first_step["expectedResult"]
+
+        task_detail_response = api_client.get(
+            f"/api/test-cases/generations/{data['taskId']}"
+        )
+        assert_http_status(task_detail_response, 200)
+        task_detail_body = assert_success_response(task_detail_response)
+
+        assert task_detail_body["data"]["taskId"] == data["taskId"]
+        assert task_detail_body["data"]["requestId"] == data["requestId"]
+
+    @allure.story("AI功能测试用例生成")
+    @allure.title("生成功能测试用例失败：必填参数为空")
+    @pytest.mark.testcase
+    def test_generate_functional_test_cases_invalid_payload_failed(self, api_client):
+        response = api_client.post(
+            "/api/test-cases/generations",
+            json_body=build_invalid_functional_test_case_generation_payload(),
+        )
+
+        assert_http_status(response, 400)
+        assert_error_response(response, expected_code=40000)
+
+    @allure.story("AI功能测试用例生成")
+    @allure.title("查询不存在的测试用例生成任务失败")
+    @pytest.mark.testcase
+    def test_get_test_case_generation_not_found(self, api_client):
+        response = api_client.get("/api/test-cases/generations/999999999")
+
+        assert_http_status(response, 404)
+        assert_error_response(response, expected_code=40405)
